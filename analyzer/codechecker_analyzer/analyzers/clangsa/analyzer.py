@@ -397,6 +397,7 @@ class ClangSA(analyzer_base.SourceAnalyzer):
             # for checker configs coming as command line argument, or those
             # should be eliminated.
             for cfg in config.checker_config:
+                cfg = f"{cfg.option}={cfg.value}"
                 analyzer_cmd.extend(
                     ['-Xclang', '-analyzer-config', '-Xclang', cfg])
 
@@ -481,6 +482,7 @@ class ClangSA(analyzer_base.SourceAnalyzer):
             return analyzer_cmd
 
         except Exception as ex:
+            LOG.error(str(ex.with_traceback()))
             LOG.error(ex)
             return []
 
@@ -688,16 +690,16 @@ class ClangSA(analyzer_base.SourceAnalyzer):
         handler.set_checker_enabled(
             ReturnValueCollector.checker_collect, False)
 
-        handler.checker_config = []
-
         # TODO: This extra "isinstance" check is needed for
         # CodeChecker checkers --checker-config. This command also runs
         # this function in order to construct a config handler.
         if 'checker_config' in args and isinstance(args.checker_config, list):
             for cfg in args.checker_config:
                 if cfg.analyzer == cls.ANALYZER_NAME:
-                    handler.checker_config.append(
-                        f"{cfg.checker}:{cfg.option}={cfg.value}")
+                    #print(type(cfg))
+                    handler.checker_config.append(cfg)
+                    # handler.checker_config.append(
+                    #    f"{cfg.checker}:{cfg.option}={cfg.value}")
 
         # TODO: This extra "isinstance" check is needed for
         # CodeChecker analyzers --analyzer-config. This command also runs
@@ -706,6 +708,7 @@ class ClangSA(analyzer_base.SourceAnalyzer):
                 isinstance(args.analyzer_config, list):
             for cfg in args.analyzer_config:
                 if cfg.analyzer == cls.ANALYZER_NAME:
-                    handler.checker_config.append(f"{cfg.option}={cfg.value}")
+                    handler.analyzer_config.append(cfg)
+                    #handler.checker_config.append(f"{cfg.option}={cfg.value}")
 
         return handler
