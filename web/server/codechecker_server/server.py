@@ -769,6 +769,9 @@ class CCSimpleHttpServer(HTTPServer):
         permissions.initialise_defaults('SYSTEM', {
             'config_db_session': cfg_sess
         })
+
+        self.cfg_sess_private = cfg_sess
+
         products = cfg_sess.query(ORMProduct).all()
         for product in products:
             self.add_product(product)
@@ -911,6 +914,46 @@ class CCSimpleHttpServer(HTTPServer):
             # pylint: disable=not-callable
 
         self.__products[prod.endpoint] = prod
+
+    def get_if_database_in_use(self, product):
+        """
+        Returns the product endpoint if the given database is in use
+        """
+        # get the database name from the product connection string
+        is_sqlite = False
+        if product.database.endswith('.sqlite'):
+            to_add = product.database.replace('////', '/')
+            is_sqlite = True
+        else:
+            to_add = f"@{product.host}:{product.port}/{product.database}"
+
+        LOG.info("The database string that will be added: %s", to_add)
+
+        LOG.info("to add: %s", to_add)
+
+        # get the current state of connected databases from products
+        dynamic_list = [
+            a.connection.replace('////', '/')
+            for a in self.cfg_sess_private.query(ORMProduct).all()
+        ]
+        self.cfg_sess_private.commit()
+        self.cfg_sess_private.close()
+
+        # remove the first 16 charecters because in query it is
+        # included in the path string
+        dynamic_list = [
+            d[16:] if d.endswith('.sqlite') else d
+            for d in dynamic_list
+        ]
+
+        # True if found, False otherwise
+        LOG.info("dynamic list: %s", dynamic_list)
+        for d in dynamic_list:
+            if d == to_add and is_sqlite:
+                return True
+            elif to_add in d and not is_sqlite:
+                return True
+        return False
 
     @property
     def num_products(self):
