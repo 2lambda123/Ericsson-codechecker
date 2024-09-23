@@ -78,6 +78,7 @@ IGNORED_OPTIONS_GCC = [
     '-ffixed-r2',
     '-ffp$',
     '-mfp16-format',
+    '-mmitigate-rop',
     '-fgcse-lm',
     '-fhoist-adjacent-loads',
     '-findirect-inlining',
@@ -98,6 +99,7 @@ IGNORED_OPTIONS_GCC = [
     '-fno-keep-inline-dllexport'
     '-fno-keep-static-consts',
     '-fno-lifetime-dse',
+    '-f(no-)?printf-return-value',
     '-f(no-)?reorder-functions',
     '-fno-strength-reduce',
     '-fno-toplevel-reorder',
@@ -1307,7 +1309,7 @@ def parse_unique_log(compilation_database,
                      and pre_analysis_skip_handlers.should_skip(
                          action.source)):
                 skipped_cmp_cmd_count += 1
-                LOG.debug("skipping:", action.source)
+                LOG.debug("skipping: %s", action.source)
                 continue
 
             if not action.lang:
