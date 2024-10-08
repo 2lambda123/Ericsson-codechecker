@@ -22,7 +22,7 @@ import zlib
 from copy import deepcopy
 from collections import OrderedDict, defaultdict, namedtuple
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Collection, Dict, List, Optional, Set, Tuple
 
 import sqlalchemy
 from sqlalchemy.sql.expression import or_, and_, not_, func, \
@@ -44,7 +44,8 @@ from codechecker_api.codeCheckerDBAccess_v6.ttypes import \
     ReviewStatusRuleSortType, RunData, RunFilter, RunHistoryData, \
     RunReportCount, RunSortType, RunTagCount, \
     ReviewStatus as API_ReviewStatus, \
-    SourceComponentData, SourceFileData, SortMode, SortType
+    SourceComponentData, SourceFileData, SortMode, SortType, \
+    SubmittedRunOptions
 
 from codechecker_common import util
 from codechecker_common.logger import get_logger
@@ -69,6 +70,7 @@ from ..database.run_db_model import \
     Run, RunHistory, RunHistoryAnalysisInfo, RunLock, \
     SourceComponent
 
+from .common import exc_to_thrift_reqfail
 from .thrift_enum_helper import detection_status_enum, \
     detection_status_str, report_status_enum, \
     review_status_enum, review_status_str, report_extended_data_type_enum
@@ -139,39 +141,6 @@ def slugify(text):
     norm_text = re.sub(r'([\s]+|[/]+)', '_', norm_text)
 
     return norm_text
-
-
-def exc_to_thrift_reqfail(function):
-    """
-    Convert internal exceptions to RequestFailed exception
-    which can be sent back on the thrift connections.
-    """
-    func_name = function.__name__
-
-    def wrapper(*args, **kwargs):
-        try:
-            res = function(*args, **kwargs)
-            return res
-
-        except sqlalchemy.exc.SQLAlchemyError as alchemy_ex:
-            # Convert SQLAlchemy exceptions.
-            msg = str(alchemy_ex)
-            import traceback
-            traceback.print_exc()
-            raise codechecker_api_shared.ttypes.RequestFailed(
-                codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
-        except codechecker_api_shared.ttypes.RequestFailed as rf:
-            LOG.warning("%s:\n%s", func_name, rf.message)
-            raise
-        except Exception as ex:
-            import traceback
-            traceback.print_exc()
-            msg = str(ex)
-            LOG.warning("%s:\n%s", func_name, msg)
-            raise codechecker_api_shared.ttypes.RequestFailed(
-                codechecker_api_shared.ttypes.ErrorCode.GENERAL, msg)
-
-    return wrapper
 
 
 def get_component_values(
@@ -1372,13 +1341,26 @@ def get_is_opened_case(subquery):
     )
 
 
+def remove_reports(session: DBSession,
+                   report_ids: Collection,
+                   chunk_size: int = SQLITE_MAX_VARIABLE_NUMBER):
+    """
+    Removes `Report`s in chunks.
+    """
+    for r_ids in util.chunks(iter(report_ids), chunk_size):
+        session.query(Report) \
+            .filter(Report.id.in_(r_ids)) \
+            .delete(synchronize_session=False)
+
+
 class ThriftRequestHandler:
     """
     Connect to database and handle thrift client requests.
     """
 
     def __init__(self,
-                 manager,
+                 session_manager,
+                 task_manager,
                  Session,
                  product,
                  auth_session,
@@ -1391,7 +1373,8 @@ class ThriftRequestHandler:
             raise ValueError("Cannot initialize request handler without "
                              "a product to serve.")
 
-        self._manager = manager
+        self._manager = session_manager
+        self._task_manager = task_manager
         self._product = product
         self._auth_session = auth_session
         self._config_database = config_database
@@ -1408,34 +1391,6 @@ class ThriftRequestHandler:
         Returns the actually logged in user name.
         """
         return self._auth_session.user if self._auth_session else "Anonymous"
-
-    def _set_run_data_for_curr_product(
-        self,
-        inc_num_of_runs: Optional[int],
-        latest_storage_date: Optional[datetime] = None
-    ):
-        """
-        Increment the number of runs related to the current product with the
-        given value and set the latest storage date.
-        """
-        values = {}
-
-        if inc_num_of_runs is not None:
-            values["num_of_runs"] = Product.num_of_runs + inc_num_of_runs
-            # FIXME: This log is likely overkill.
-            LOG.info("Run counter in the config database was %s by %i.",
-                     'increased' if inc_num_of_runs >= 0 else 'decreased',
-                     abs(inc_num_of_runs))
-
-        if latest_storage_date is not None:
-            values["latest_storage_date"] = latest_storage_date
-
-        with DBSession(self._config_database) as session:
-            session.query(Product) \
-                .filter(Product.id == self._product.id) \
-                .update(values)
-
-            session.commit()
 
     def __require_permission(self, required):
         """
@@ -3629,16 +3584,6 @@ class ThriftRequestHandler:
                 failed = True
         return not failed
 
-    def _removeReports(self, session, report_ids,
-                       chunk_size=SQLITE_MAX_VARIABLE_NUMBER):
-        """
-        Removing reports in chunks.
-        """
-        for r_ids in util.chunks(iter(report_ids), chunk_size):
-            session.query(Report) \
-                .filter(Report.id.in_(r_ids)) \
-                .delete(synchronize_session=False)
-
     @exc_to_thrift_reqfail
     @timeit
     def removeRunReports(self, run_ids, report_filter, cmp_data):
@@ -3668,7 +3613,7 @@ class ThriftRequestHandler:
 
                 reports_to_delete = [r[0] for r in q]
                 if reports_to_delete:
-                    self._removeReports(session, reports_to_delete)
+                    remove_reports(session, reports_to_delete)
 
                 session.commit()
                 session.close()
@@ -3740,9 +3685,9 @@ class ThriftRequestHandler:
             LOG.info("Runs '%s' were removed by '%s'.", "', '".join(runs),
                      self._get_username())
 
-        # Decrement the number of runs but do not update the latest storage
-        # date.
-        self._set_run_data_for_curr_product(-1 * deleted_run_cnt)
+        self._product.set_cached_run_data(
+            self._config_database,
+            number_of_runs_change=-1 * deleted_run_cnt)
 
         # Remove unused comments and unused analysis info from the database.
         # Originally db_cleanup.remove_unused_data() was used here which
@@ -3925,16 +3870,92 @@ class ThriftRequestHandler:
             return list(set(file_hashes) -
                         set(fc.content_hash for fc in q))
 
+    def __massStoreRun_common(self, is_async: bool, zipfile_blob: str,
+                              store_opts: SubmittedRunOptions) -> str:
+        self.__require_store()
+        if not store_opts.runName:
+            raise ValueError("A run name is needed to know where to store!")
+
+        from .mass_store_run import MassStoreRunInputHandler, MassStoreRunTask
+        ih = MassStoreRunInputHandler(self._manager,
+                                      self._config_database,
+                                      self._Session,
+                                      self._task_manager,
+                                      self._context,
+                                      self._product.id,
+                                      store_opts.runName,
+                                      store_opts.description,
+                                      store_opts.tag,
+                                      store_opts.version,
+                                      store_opts.force,
+                                      store_opts.trimPathPrefixes,
+                                      zipfile_blob,
+                                      self._get_username())
+        ih.check_store_input_validity_at_face_value()
+        m: MassStoreRunTask = ih.create_mass_store_task(is_async)
+        self._task_manager.push_task(m)
+
+        return m.token
+
     @exc_to_thrift_reqfail
     @timeit
-    def massStoreRun(self, name, tag, version, b64zip, force,
-                     trim_path_prefixes, description):
-        self.__require_store()
+    def massStoreRun(self,
+                     name: str,
+                     tag: Optional[str],
+                     version: str,
+                     b64zip: str,
+                     force: bool,
+                     trim_path_prefixes: Optional[List[str]],
+                     description: Optional[str]) -> int:
+        store_opts = SubmittedRunOptions(runName=name,
+                                         tag=tag,
+                                         version=version,
+                                         force=force,
+                                         trimPathPrefixes=trim_path_prefixes,
+                                         description=description,
+                                         )
+        token = self.__massStoreRun_common(False, b64zip, store_opts)
 
-        from codechecker_server.api.mass_store_run import MassStoreRun
-        m = MassStoreRun(self, name, tag, version, b64zip, force,
-                         trim_path_prefixes, description)
-        return m.store()
+        LOG.info("massStoreRun(): Blocking until task '%s' terminates ...",
+                 token)
+
+        # To be compatible with older (<= 6.24, API <= 6.58) clients which
+        # may keep using the old API endpoint, simulate awaiting the
+        # background task in the API handler.
+        while True:
+            time.sleep(5)
+            t = self._task_manager.get_task_record(token)
+            if t.is_in_terminated_state:
+                if t.status == "failed":
+                    raise codechecker_api_shared.ttypes.RequestFailed(
+                        codechecker_api_shared.ttypes.ErrorCode.GENERAL,
+                        "massStoreRun()'s processing failed. Here follow "
+                        f"the details:\n\n{t.comments}")
+                if t.status == "cancelled":
+                    raise codechecker_api_shared.ttypes.RequestFailed(
+                        codechecker_api_shared.ttypes.ErrorCode.GENERAL,
+                        "Server administrators cancelled the processing of "
+                        "the massStoreRun() request!")
+                break
+
+        # Prior to CodeChecker 6.25.0 (API v6.59), massStoreRun() was
+        # completely synchronous and blocking, and the implementation of the
+        # storage logic returned the ID of the run that was stored by the
+        # call.
+        # massStoreRun() was implemented in
+        # commit 2b29d787599da0318cd23dbe816377b9bce7236c (September 2017),
+        # replacing the previously used (and then completely removed!)
+        # addCheckerRun() function, which also returned the run's ID.
+        # The official client implementation stopped using this returned value
+        # from the moment of massStoreRun()'s implementation.
+        return -1
+
+    @exc_to_thrift_reqfail
+    @timeit
+    def massStoreRunAsynchronous(self, zipfile_blob: str,
+                                 store_opts: SubmittedRunOptions) -> str:
+        token = self.__massStoreRun_common(True, zipfile_blob, store_opts)
+        return token
 
     @exc_to_thrift_reqfail
     @timeit
