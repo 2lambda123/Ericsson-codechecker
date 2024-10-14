@@ -892,6 +892,7 @@ def main(args):
         args_to_update = ['quiet',
                           'skipfile',
                           'files',
+                          'plist_file_name',
                           'analyzers',
                           'add_compiler_defaults',
                           'cppcheck_args_cfg_file',
